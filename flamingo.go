@@ -17,9 +17,8 @@ type workerId uint64
 
 type connection struct {
     conn     *net.Conn
-    id       Id
+    cid      Id
 }
-
 
 type command interface {
     ConnId()  Id
@@ -33,14 +32,14 @@ const (
 )
 
 type message struct {
-    id  Id
+    cid  Id
     msg []byte
 }
 
 //A message being interpreted as a command is always going to be a write command,
 //the data in the message being what is written
 func (m *message) Type()   int { return WRITE }
-func (m *message) ConnId() Id  { return m.id  }
+func (m *message) ConnId() Id  { return m.cid  }
 
 type closeCommand Id
 func (c *closeCommand) Type()   int { return CLOSE }
@@ -72,31 +71,31 @@ func New(port int) (*Flamingo) {
 
 func (f *Flamingo) RecvData() (Id,[]byte) {
     msg := <- f.globalReadCh
-    return msg.id, msg.msg
+    return msg.cid, msg.msg
 }
 
-func (f *Flamingo) SendData(id Id, msg []byte) {
-    wrmsg := message{ id, msg }
-    f.routeCommand(id,&wrmsg)
+func (f *Flamingo) SendData(cid Id, msg []byte) {
+    wrmsg := message{ cid, msg }
+    f.routeCommand(cid,&wrmsg)
 }
 
-func (f *Flamingo) Close(id Id) {
-    cmsg := closeCommand(id)
-    f.routeCommand(id,&cmsg)
+func (f *Flamingo) Close(cid Id) {
+    cmsg := closeCommand(cid)
+    f.routeCommand(cid,&cmsg)
 }
 
-func (f *Flamingo) routeCommand(id Id, c command) {
-    f.commandRouter[ workerId( id / CONNS_PER_WORKER ) ] <- c
+func (f *Flamingo) routeCommand(cid Id, c command) {
+    f.commandRouter[ workerId( cid / CONNS_PER_WORKER ) ] <- c
 }
 
 func makeAcceptors(listener net.Listener) chan *connection {
     ch := make(chan *connection)
 
     //Create routine to atomically get incremental numbers
-    ich := make(chan uint64)
-    var i uint64 = 0
+    cidCh := make(chan Id)
     go func() {
-        for { ich <- i; i++ }
+        var i Id = 0
+        for { cidCh <- i; i++ }
     }()
 
 
@@ -106,8 +105,8 @@ func makeAcceptors(listener net.Listener) chan *connection {
                 client, err := listener.Accept()
                 if client == nil { fmt.Printf("accept failed"+err.Error()+"\n"); continue }
 
-                i := Id(<-ich)
-                connection := &connection{ &client, i }
+                cid := <-cidCh
+                connection := &connection{ &client, cid }
 
                 ch <- connection
             }
@@ -119,12 +118,12 @@ func makeAcceptors(listener net.Listener) chan *connection {
 
 func distributor(f *Flamingo, incomingCh chan *connection) {
     commandRouter := f.commandRouter
-    for i := workerId(0); ; i++ {
-        commandCh        := make(chan command,20)
+    for wid := workerId(0);;wid++ {
+        workerCommandCh  := make(chan command,20)
         workerIncomingCh := make(chan *connection,20)
 
-        go worker(f,i,workerIncomingCh,commandCh)
-        commandRouter[i] = commandCh
+        go worker(f,wid,workerIncomingCh,workerCommandCh)
+        commandRouter[wid] = workerCommandCh
 
         //This works, but I think it's a bottleneck
         for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
@@ -135,7 +134,7 @@ func distributor(f *Flamingo, incomingCh chan *connection) {
     }
 }
 
-func worker(f *Flamingo, i workerId, incomingCh chan *connection, commandCh chan command) {
+func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh chan command) {
 
     globalReadCh  := f.globalReadCh
     commandRouter := f.commandRouter
@@ -155,11 +154,11 @@ func worker(f *Flamingo, i workerId, incomingCh chan *connection, commandCh chan
 
         for loop := true; loop == true; {
             select {
-                case connection := <-incomingCh:
-                    if connection == nil {
+                case conn := <-incomingCh:
+                    if conn == nil {
                         stillInUse = false
                     } else {
-                        connL[ connection.id % CONNS_PER_WORKER ] = connection
+                        connL[ conn.cid % CONNS_PER_WORKER ] = conn
                         connSlotsUsed++
                     }
 
@@ -188,7 +187,7 @@ func worker(f *Flamingo, i workerId, incomingCh chan *connection, commandCh chan
             //TODO it's possible that the user's routines may write here after the nil,
             //     do we care? At this point all connections should be closed so it's
             //     probably moot
-            delete(commandRouter,i)
+            delete(commandRouter,wid)
             return
         }
     }
@@ -204,7 +203,7 @@ func tryRead(globalReadCh chan *message, c *connection) error {
     if err == io.EOF {
         return err
     } else if bcount > 0 {
-        msg := &message{ c.id, buf }
+        msg := &message{ c.cid, buf }
         globalReadCh <- msg
     }
     return nil
