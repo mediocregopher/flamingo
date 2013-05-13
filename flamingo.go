@@ -9,7 +9,7 @@ import (
 )
 
 const CONN_TIMEOUT_CHECK = 10 //seconds
-const CONNS_PER_WORKER = 5
+const CONNS_PER_WORKER = 500
 const ESTIMATED_CONNS = 1e6
 
 type connection struct {
@@ -40,7 +40,7 @@ func (m *message) ConnId() uint64 { return m.id  }
 
 type Flamingo struct {
     globalReaderCh chan *message
-    commandRouter  *[]chan command
+    commandRouter  map[uint64]chan command
 }
 
 func New(port int) (*Flamingo) {
@@ -48,7 +48,7 @@ func New(port int) (*Flamingo) {
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
 
-    commandRouter := make([]chan command, 0, ESTIMATED_CONNS/CONNS_PER_WORKER)
+    commandRouter := map[uint64]chan command{}
 
     //Spawn a routine to listen for new connections
     incomingCh := accepter(server)
@@ -56,9 +56,10 @@ func New(port int) (*Flamingo) {
     //The channel that we can read from to get data from connections
     globalReaderCh := make(chan *message,2000)
 
-    go distributor(&commandRouter,incomingCh,globalReaderCh)
+    flamingo := &Flamingo{ globalReaderCh, commandRouter }
+    go distributor(flamingo,incomingCh)
 
-    return &Flamingo{ globalReaderCh, &commandRouter }
+    return flamingo
 }
 
 func (f *Flamingo) RecvData() (uint64,[]byte) {
@@ -68,7 +69,7 @@ func (f *Flamingo) RecvData() (uint64,[]byte) {
 
 func (f *Flamingo) SendData(id uint64, msg []byte) {
     wrmsg := &message{ id, msg }
-    (*f.commandRouter)[ id / CONNS_PER_WORKER ] <- wrmsg
+    f.commandRouter[ id / CONNS_PER_WORKER ] <- wrmsg
 }
 
 func accepter(listener net.Listener) chan *connection {
@@ -99,13 +100,14 @@ func accepter(listener net.Listener) chan *connection {
     return ch
 }
 
-func distributor(commandRouter *[]chan command, incomingCh chan *connection, globalReaderCh chan *message) {
-    for {
+func distributor(f *Flamingo, incomingCh chan *connection) {
+    commandRouter := f.commandRouter
+    for i := uint64(0); ; i++ {
         commandCh        := make(chan command,20)
         workerIncomingCh := make(chan *connection,20)
 
-        go worker(workerIncomingCh,globalReaderCh,commandCh)
-        *commandRouter = append(*commandRouter,commandCh)
+        go worker(f,i,workerIncomingCh,commandCh)
+        commandRouter[i] = commandCh
 
         //This works, but I think it's a bottleneck
         for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
@@ -116,7 +118,10 @@ func distributor(commandRouter *[]chan command, incomingCh chan *connection, glo
     }
 }
 
-func worker(incomingCh chan *connection, globalReaderCh chan *message, commandCh chan command) {
+func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan command) {
+
+    globalReaderCh := f.globalReaderCh
+    commandRouter  := f.commandRouter
 
     connL := make([]*connection,CONNS_PER_WORKER)
     connSlotsUsed := 0
@@ -142,9 +147,9 @@ func worker(incomingCh chan *connection, globalReaderCh chan *message, commandCh
                     }
 
                 case command := <- commandCh:
-                    i := command.ConnId() % CONNS_PER_WORKER
+                    ci := command.ConnId() % CONNS_PER_WORKER
                     if command.Type() == WRITE {
-                        conn := connL[i]
+                        conn := connL[ci]
                         msg := command.(*message).msg
                         (*conn.conn).Write(msg)
                     }
@@ -159,6 +164,7 @@ func worker(incomingCh chan *connection, globalReaderCh chan *message, commandCh
             //TODO it's possible that the user's routines may write here after the nil,
             //     do we care? At this point all connections should be closed so it's
             //     probably moot
+            delete(commandRouter,i)
             return
         }
     }
