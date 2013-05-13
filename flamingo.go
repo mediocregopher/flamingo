@@ -57,7 +57,13 @@ func newCommandRouter() (*commandRouter) {
 }
 
 type Flamingo struct {
-    globalReadCh chan *message
+    //These are going to be read from by the application
+    globalOpenCh  chan *connection
+    globalReadCh  chan *message
+    globalCloseCh chan *connection
+
+    //For private use
+    incomingCh   chan *connection
     cmdR         *commandRouter
 }
 
@@ -66,16 +72,23 @@ func New(port int) (*Flamingo) {
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
 
+    flamingo := &Flamingo{ globalOpenCh:  make(chan *connection,2000),
+                           globalReadCh:  make(chan *message,2000),
+                           globalCloseCh: make(chan *connection,2000),
+                           incomingCh:    make(chan *connection),
+                           cmdR:          newCommandRouter() }
+
     //Spawn a routine to listen for new connections
-    incomingCh := makeAcceptors(server)
+    makeAcceptors(flamingo,server)
 
-    //The channel that we can read from to get data from connections
-    globalReadCh := make(chan *message,2000)
-
-    flamingo := &Flamingo{ globalReadCh, newCommandRouter() }
-    go distributor(flamingo,incomingCh)
+    go distributor(flamingo)
 
     return flamingo
+}
+
+func (f *Flamingo) RecvOpen() (Id,net.Conn) {
+    c := <- f.globalOpenCh
+    return c.cid, *c.conn
 }
 
 func (f *Flamingo) RecvData() (Id,[]byte) {
@@ -88,7 +101,12 @@ func (f *Flamingo) SendData(cid Id, msg []byte) {
     f.routeCommand(cid,&wrmsg)
 }
 
-func (f *Flamingo) Close(cid Id) {
+func (f *Flamingo) RecvClose() Id {
+    c := <- f.globalCloseCh
+    return c.cid
+}
+
+func (f *Flamingo) SendClose(cid Id) {
     cmsg := closeCommand(cid)
     f.routeCommand(cid,&cmsg)
 }
@@ -99,8 +117,7 @@ func (f *Flamingo) routeCommand(cid Id, c command) {
     f.cmdR.RUnlock()
 }
 
-func makeAcceptors(listener net.Listener) chan *connection {
-    ch := make(chan *connection)
+func makeAcceptors(f *Flamingo, listener net.Listener) {
 
     //Create routine to atomically get incremental numbers
     cidCh := make(chan Id)
@@ -119,15 +136,15 @@ func makeAcceptors(listener net.Listener) chan *connection {
                 cid := <-cidCh
                 connection := &connection{ &client, cid }
 
-                ch <- connection
+                f.incomingCh <- connection
+                f.globalOpenCh <- connection
             }
         }()
     }
 
-    return ch
 }
 
-func distributor(f *Flamingo, incomingCh chan *connection) {
+func distributor(f *Flamingo) {
     for wid := workerId(0);;wid++ {
         workerCommandCh  := make(chan command,20)
         workerIncomingCh := make(chan *connection,20)
@@ -139,7 +156,7 @@ func distributor(f *Flamingo, incomingCh chan *connection) {
 
         //This works, but I think it's a bottleneck
         for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
-            workerIncomingCh <- <- incomingCh
+            workerIncomingCh <- <- f.incomingCh
         }
 
         workerIncomingCh <- nil
@@ -159,7 +176,12 @@ func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh ch
         for i,conn := range connL {
             if (conn != nil) {
                 err := tryRead(globalReadCh,conn)
-                if err != nil { connL[i] = nil; connSlotsUsed--; }
+                if err != nil {
+                    (*conn.conn).Close()
+                    connL[i] = nil
+                    connSlotsUsed--
+                    f.globalCloseCh <- conn
+                }
             }
         }
 
