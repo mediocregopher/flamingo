@@ -12,14 +12,17 @@ const CONN_TIMEOUT_CHECK = 10 //seconds
 const CONNS_PER_WORKER = 500
 const ESTIMATED_CONNS = 1e6
 
+type Id uint64
+type workerId uint64
+
 type connection struct {
     conn     *net.Conn
-    id       uint64
+    id       Id
 }
 
 
 type command interface {
-    ConnId()  uint64
+    ConnId()  Id
     Type()    int
 }
 
@@ -30,22 +33,22 @@ const (
 )
 
 type message struct {
-    id  uint64
+    id  Id
     msg []byte
 }
 
 //A message being interpreted as a command is always going to be a write command,
 //the data in the message being what is written
-func (m *message) Type()   int    { return WRITE }
-func (m *message) ConnId() uint64 { return m.id  }
+func (m *message) Type()   int { return WRITE }
+func (m *message) ConnId() Id  { return m.id  }
 
-type closeCommand uint64
-func (c *closeCommand) Type()   int    { return CLOSE }
-func (c *closeCommand) ConnId() uint64 { return uint64(*c) }
+type closeCommand Id
+func (c *closeCommand) Type()   int { return CLOSE }
+func (c *closeCommand) ConnId() Id  { return Id(*c) }
 
 type Flamingo struct {
     globalReadCh chan *message
-    commandRouter  map[uint64]chan command
+    commandRouter  map[workerId]chan command
 }
 
 func New(port int) (*Flamingo) {
@@ -53,7 +56,7 @@ func New(port int) (*Flamingo) {
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
 
-    commandRouter := map[uint64]chan command{}
+    commandRouter := map[workerId]chan command{}
 
     //Spawn a routine to listen for new connections
     incomingCh := makeAcceptors(server)
@@ -67,20 +70,23 @@ func New(port int) (*Flamingo) {
     return flamingo
 }
 
-func (f *Flamingo) RecvData() (uint64,[]byte) {
+func (f *Flamingo) RecvData() (Id,[]byte) {
     msg := <- f.globalReadCh
     return msg.id, msg.msg
 }
 
-func (f *Flamingo) SendData(id uint64, msg []byte) {
-    wrmsg := &message{ id, msg }
-    f.commandRouter[ id / CONNS_PER_WORKER ] <- wrmsg
+func (f *Flamingo) SendData(id Id, msg []byte) {
+    wrmsg := message{ id, msg }
+    f.routeCommand(id,&wrmsg)
 }
 
-func (f *Flamingo) Close(id uint64) {
+func (f *Flamingo) Close(id Id) {
     cmsg := closeCommand(id)
-    f.commandRouter[ id / CONNS_PER_WORKER ] <- &cmsg
-    fmt.Printf("commandRouter:%v\n",f.commandRouter)
+    f.routeCommand(id,&cmsg)
+}
+
+func (f *Flamingo) routeCommand(id Id, c command) {
+    f.commandRouter[ workerId( id / CONNS_PER_WORKER ) ] <- c
 }
 
 func makeAcceptors(listener net.Listener) chan *connection {
@@ -100,7 +106,7 @@ func makeAcceptors(listener net.Listener) chan *connection {
                 client, err := listener.Accept()
                 if client == nil { fmt.Printf("accept failed"+err.Error()+"\n"); continue }
 
-                i := <-ich
+                i := Id(<-ich)
                 connection := &connection{ &client, i }
 
                 ch <- connection
@@ -113,7 +119,7 @@ func makeAcceptors(listener net.Listener) chan *connection {
 
 func distributor(f *Flamingo, incomingCh chan *connection) {
     commandRouter := f.commandRouter
-    for i := uint64(0); ; i++ {
+    for i := workerId(0); ; i++ {
         commandCh        := make(chan command,20)
         workerIncomingCh := make(chan *connection,20)
 
@@ -129,10 +135,10 @@ func distributor(f *Flamingo, incomingCh chan *connection) {
     }
 }
 
-func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan command) {
+func worker(f *Flamingo, i workerId, incomingCh chan *connection, commandCh chan command) {
 
-    globalReadCh := f.globalReadCh
-    commandRouter  := f.commandRouter
+    globalReadCh  := f.globalReadCh
+    commandRouter := f.commandRouter
 
     connL := make([]*connection,CONNS_PER_WORKER)
     connSlotsUsed := 0
