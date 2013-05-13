@@ -6,6 +6,7 @@ import (
     "time"
     "io"
     "strconv"
+    "sync"
 )
 
 const CONN_TIMEOUT_CHECK = 10 //seconds
@@ -45,9 +46,19 @@ type closeCommand Id
 func (c *closeCommand) Type()   int { return CLOSE }
 func (c *closeCommand) ConnId() Id  { return Id(*c) }
 
+type commandRouter struct {
+    sync.RWMutex
+    m map[workerId]chan command
+}
+func newCommandRouter() (*commandRouter) {
+    return &commandRouter{
+        m: map[workerId]chan command{},
+    }
+}
+
 type Flamingo struct {
     globalReadCh chan *message
-    commandRouter  map[workerId]chan command
+    cmdR         *commandRouter
 }
 
 func New(port int) (*Flamingo) {
@@ -55,15 +66,13 @@ func New(port int) (*Flamingo) {
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
 
-    commandRouter := map[workerId]chan command{}
-
     //Spawn a routine to listen for new connections
     incomingCh := makeAcceptors(server)
 
     //The channel that we can read from to get data from connections
     globalReadCh := make(chan *message,2000)
 
-    flamingo := &Flamingo{ globalReadCh, commandRouter }
+    flamingo := &Flamingo{ globalReadCh, newCommandRouter() }
     go distributor(flamingo,incomingCh)
 
     return flamingo
@@ -85,7 +94,9 @@ func (f *Flamingo) Close(cid Id) {
 }
 
 func (f *Flamingo) routeCommand(cid Id, c command) {
-    f.commandRouter[ workerId( cid / CONNS_PER_WORKER ) ] <- c
+    f.cmdR.RLock()
+    f.cmdR.m[ workerId( cid / CONNS_PER_WORKER ) ] <- c
+    f.cmdR.RUnlock()
 }
 
 func makeAcceptors(listener net.Listener) chan *connection {
@@ -117,13 +128,14 @@ func makeAcceptors(listener net.Listener) chan *connection {
 }
 
 func distributor(f *Flamingo, incomingCh chan *connection) {
-    commandRouter := f.commandRouter
     for wid := workerId(0);;wid++ {
         workerCommandCh  := make(chan command,20)
         workerIncomingCh := make(chan *connection,20)
 
         go worker(f,wid,workerIncomingCh,workerCommandCh)
-        commandRouter[wid] = workerCommandCh
+        f.cmdR.Lock()
+        f.cmdR.m[wid] = workerCommandCh
+        f.cmdR.Unlock()
 
         //This works, but I think it's a bottleneck
         for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
@@ -137,7 +149,6 @@ func distributor(f *Flamingo, incomingCh chan *connection) {
 func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh chan command) {
 
     globalReadCh  := f.globalReadCh
-    commandRouter := f.commandRouter
 
     connL := make([]*connection,CONNS_PER_WORKER)
     connSlotsUsed := 0
@@ -187,7 +198,9 @@ func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh ch
             //TODO it's possible that the user's routines may write here after the nil,
             //     do we care? At this point all connections should be closed so it's
             //     probably moot
-            delete(commandRouter,wid)
+            f.cmdR.Lock()
+            delete(f.cmdR.m,wid)
+            f.cmdR.Unlock()
             return
         }
     }
