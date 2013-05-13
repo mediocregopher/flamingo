@@ -109,3 +109,4 @@ Flamingo is still in development and is far from being stable or production read
 * Make some real documentation
 * Load test this thing, haven't done so since the first iteration, of which only the core code is left
 * Method for serializing the id
+* Creating timeouts for socket inactivity
