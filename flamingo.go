@@ -11,7 +11,6 @@ import (
 
 const CONN_TIMEOUT_CHECK = 10 //seconds
 const CONNS_PER_WORKER = 500
-const ESTIMATED_CONNS = 1e6
 
 type Id uint64
 type workerId uint64
