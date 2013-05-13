@@ -51,7 +51,7 @@ func New(port int) (*Flamingo) {
     commandRouter := map[uint64]chan command{}
 
     //Spawn a routine to listen for new connections
-    incomingCh := accepter(server)
+    incomingCh := makeAcceptors(server)
 
     //The channel that we can read from to get data from connections
     globalReaderCh := make(chan *message,2000)
@@ -72,7 +72,7 @@ func (f *Flamingo) SendData(id uint64, msg []byte) {
     f.commandRouter[ id / CONNS_PER_WORKER ] <- wrmsg
 }
 
-func accepter(listener net.Listener) chan *connection {
+func makeAcceptors(listener net.Listener) chan *connection {
     ch := make(chan *connection)
 
     //Create routine to atomically get incremental numbers
