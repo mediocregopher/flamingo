@@ -4,32 +4,51 @@ import (
     "net"
     "fmt"
     "time"
-    "container/list"
     "io"
     "strconv"
 )
 
 const CONN_TIMEOUT_CHECK = 10 //seconds
 const CONNS_PER_WORKER = 500
+const ESTIMATED_CONNS = 1e6
 
 type Connection struct {
     conn     *net.Conn
     id       uint64
-    writerCh chan *WriteMessage
 }
 
-type Message struct {
-    connection    *Connection
-    msg           []byte
+type MessageStruct struct {
+    id  uint64
+    msg []byte
 }
 
-type ReadMessage  Message
-type WriteMessage Message
+type Message interface {
+    Id()      uint64
+    Command() int
+}
 
-func New(port int) (chan *ReadMessage) {
+type ReadMessage  MessageStruct
+type WriteMessage MessageStruct
+
+//Types of commands
+const (
+    WRITE = iota
+    CLOSE
+)
+func (m *WriteMessage) Command() int    { return WRITE }
+func (m *WriteMessage) Id()      uint64 { return m.id  }
+
+type Application struct {
+    globalReaderCh chan *ReadMessage
+    commandRouter  *[]chan Message
+}
+
+func NewApp(port int) (*Application) {
     //Make our listen socket
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
+
+    commandRouter := make([]chan Message, 0, ESTIMATED_CONNS/CONNS_PER_WORKER)
 
     //Spawn a routine to listen for new connections
     incomingCh := accepter(server)
@@ -37,17 +56,20 @@ func New(port int) (chan *ReadMessage) {
     //The channel that we can read from to get data from connections
     globalReaderCh := make(chan *ReadMessage,2000)
 
-    go distributor(incomingCh,globalReaderCh)
+    go distributor(&commandRouter,incomingCh,globalReaderCh)
 
-    return globalReaderCh
+    return &Application{ globalReaderCh, &commandRouter }
 }
 
-func (msg *ReadMessage) Respond(response *[]byte) {
-    msg.connection.writerCh <- &WriteMessage{msg.connection,*response}
+func (a *Application) RecvData() (uint64,[]byte) {
+    msg := <- a.globalReaderCh
+    return msg.id, msg.msg
 }
 
-func (msg *ReadMessage)  Data() *[]byte { return &msg.msg }
-func (msg *WriteMessage) Data() *[]byte { return &msg.msg }
+func (a *Application) SendData(id uint64, msg []byte) {
+    wrmsg := &WriteMessage{ id, msg }
+    (*a.commandRouter)[ id / CONNS_PER_WORKER ] <- wrmsg
+}
 
 func accepter(listener net.Listener) chan *Connection {
     ch := make(chan *Connection)
@@ -67,7 +89,7 @@ func accepter(listener net.Listener) chan *Connection {
                 if client == nil { fmt.Printf("accept failed"+err.Error()+"\n"); continue }
 
                 i := <-ich
-                connection := &Connection{ &client, i, nil }
+                connection := &Connection{ &client, i }
 
                 ch <- connection
             }
@@ -77,13 +99,13 @@ func accepter(listener net.Listener) chan *Connection {
     return ch
 }
 
-func distributor(incomingCh chan *Connection, globalReaderCh chan *ReadMessage) {
+func distributor(commandRouter *[]chan Message, incomingCh chan *Connection, globalReaderCh chan *ReadMessage) {
     for {
-        writerCh         := make(chan *WriteMessage,20)
+        commandCh        := make(chan Message,20)
         workerIncomingCh := make(chan *Connection,20)
 
-        go reader(workerIncomingCh,globalReaderCh,writerCh)
-        go writer(writerCh)
+        go worker(workerIncomingCh,globalReaderCh,commandCh)
+        *commandRouter = append(*commandRouter,commandCh)
 
         //This works, but I think it's a bottleneck
         for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
@@ -94,16 +116,19 @@ func distributor(incomingCh chan *Connection, globalReaderCh chan *ReadMessage) 
     }
 }
 
-func reader(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, writerCh chan *WriteMessage) {
+func worker(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, commandCh chan Message) {
 
-    connL := list.New()
+    connL := make([]*Connection,CONNS_PER_WORKER)
+    connSlotsUsed := 0
+
     stillInUse := true
 
     for {
-        for e := connL.Front(); e != nil; e = e.Next() {
-            connection := e.Value.(*Connection)
-            err := tryRead(globalReaderCh,connection)
-            if err != nil { connL.Remove(e) }
+        for i,conn := range connL {
+            if (conn != nil) {
+                err := tryRead(globalReaderCh,conn)
+                if err != nil { connL[i] = nil; connSlotsUsed--; }
+            }
         }
 
         for loop := true; loop == true; {
@@ -112,8 +137,16 @@ func reader(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, write
                     if connection == nil {
                         stillInUse = false
                     } else {
-                        connection.writerCh = writerCh
-                        connL.PushBack(connection)
+                        connL[ connection.id % CONNS_PER_WORKER ] = connection
+                        connSlotsUsed++
+                    }
+
+                case command := <- commandCh:
+                    i := command.Id() % CONNS_PER_WORKER
+                    if command.Command() == WRITE {
+                        conn := connL[i]
+                        msg := command.(*WriteMessage).msg
+                        (*conn.conn).Write(msg)
                     }
                 default:
                     loop = false
@@ -122,24 +155,11 @@ func reader(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, write
 
         //If we're not in use (no incoming conns) and there's none
         //connected we're done. Tell the writer we're done too
-        if !stillInUse && connL.Len() == 0 {
+        if !stillInUse && connSlotsUsed == 0 {
             //TODO it's possible that the user's routines may write here after the nil,
             //     do we care? At this point all connections should be closed so it's
             //     probably moot
-            writerCh <- nil
             return
-        }
-    }
-}
-
-func writer(writerCh chan *WriteMessage) {
-    for {
-        msg := <-writerCh
-        if msg == nil {
-            return
-        } else {
-            (*msg.connection.conn).Write(msg.msg) //Don't care about errors, no way to report them
-                                                  //anyway
         }
     }
 }
@@ -154,7 +174,7 @@ func tryRead(globalReaderCh chan *ReadMessage, connection *Connection) error {
     if err == io.EOF {
         return err
     } else if bcount > 0 {
-        msg := &ReadMessage{ connection, buf }
+        msg := &ReadMessage{ connection.id, buf }
         globalReaderCh <- msg
     }
     return nil
