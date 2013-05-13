@@ -9,70 +9,70 @@ import (
 )
 
 const CONN_TIMEOUT_CHECK = 10 //seconds
-const CONNS_PER_WORKER = 500
+const CONNS_PER_WORKER = 5
 const ESTIMATED_CONNS = 1e6
 
-type Connection struct {
+type connection struct {
     conn     *net.Conn
     id       uint64
 }
 
-type MessageStruct struct {
+type message struct {
     id  uint64
     msg []byte
 }
 
-type Message interface {
-    Id()      uint64
-    Command() int
+type command interface {
+    ConnId()  uint64
+    Type()    int
 }
-
-type ReadMessage  MessageStruct
-type WriteMessage MessageStruct
 
 //Types of commands
 const (
     WRITE = iota
     CLOSE
 )
-func (m *WriteMessage) Command() int    { return WRITE }
-func (m *WriteMessage) Id()      uint64 { return m.id  }
 
-type Application struct {
-    globalReaderCh chan *ReadMessage
-    commandRouter  *[]chan Message
+//A message being interpreted as a command is always going to be a write command,
+//the data in the message being what is written
+func (m *message) Type()   int    { return WRITE }
+func (m *message) ConnId() uint64 { return m.id  }
+
+type Flamingo struct {
+    globalReaderCh chan *message
+    commandRouter  *[]chan command
 }
 
-func NewApp(port int) (*Application) {
+func New(port int) (*Flamingo) {
     //Make our listen socket
     server, err := net.Listen( "tcp", ":" + strconv.Itoa(port) )
     if server == nil { panic("couldn't start listening: " + err.Error()) }
 
-    commandRouter := make([]chan Message, 0, ESTIMATED_CONNS/CONNS_PER_WORKER)
+    commandRouter := make([]chan command, 0, ESTIMATED_CONNS/CONNS_PER_WORKER)
 
     //Spawn a routine to listen for new connections
     incomingCh := accepter(server)
 
     //The channel that we can read from to get data from connections
-    globalReaderCh := make(chan *ReadMessage,2000)
+    globalReaderCh := make(chan *message,2000)
 
     go distributor(&commandRouter,incomingCh,globalReaderCh)
 
-    return &Application{ globalReaderCh, &commandRouter }
+    return &Flamingo{ globalReaderCh, &commandRouter }
 }
 
-func (a *Application) RecvData() (uint64,[]byte) {
-    msg := <- a.globalReaderCh
+func (f *Flamingo) RecvData() (uint64,[]byte) {
+    msg := <- f.globalReaderCh
     return msg.id, msg.msg
 }
 
-func (a *Application) SendData(id uint64, msg []byte) {
-    wrmsg := &WriteMessage{ id, msg }
-    (*a.commandRouter)[ id / CONNS_PER_WORKER ] <- wrmsg
+func (f *Flamingo) SendData(id uint64, msg []byte) {
+    wrmsg := &message{ id, msg }
+    (*f.commandRouter)[ id / CONNS_PER_WORKER ] <- wrmsg
 }
 
-func accepter(listener net.Listener) chan *Connection {
-    ch := make(chan *Connection)
+func accepter(listener net.Listener) chan *connection {
+    ch := make(chan *connection)
 
     //Create routine to atomically get incremental numbers
     ich := make(chan uint64)
@@ -89,7 +89,7 @@ func accepter(listener net.Listener) chan *Connection {
                 if client == nil { fmt.Printf("accept failed"+err.Error()+"\n"); continue }
 
                 i := <-ich
-                connection := &Connection{ &client, i }
+                connection := &connection{ &client, i }
 
                 ch <- connection
             }
@@ -99,10 +99,10 @@ func accepter(listener net.Listener) chan *Connection {
     return ch
 }
 
-func distributor(commandRouter *[]chan Message, incomingCh chan *Connection, globalReaderCh chan *ReadMessage) {
+func distributor(commandRouter *[]chan command, incomingCh chan *connection, globalReaderCh chan *message) {
     for {
-        commandCh        := make(chan Message,20)
-        workerIncomingCh := make(chan *Connection,20)
+        commandCh        := make(chan command,20)
+        workerIncomingCh := make(chan *connection,20)
 
         go worker(workerIncomingCh,globalReaderCh,commandCh)
         *commandRouter = append(*commandRouter,commandCh)
@@ -116,9 +116,9 @@ func distributor(commandRouter *[]chan Message, incomingCh chan *Connection, glo
     }
 }
 
-func worker(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, commandCh chan Message) {
+func worker(incomingCh chan *connection, globalReaderCh chan *message, commandCh chan command) {
 
-    connL := make([]*Connection,CONNS_PER_WORKER)
+    connL := make([]*connection,CONNS_PER_WORKER)
     connSlotsUsed := 0
 
     stillInUse := true
@@ -142,10 +142,10 @@ func worker(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, comma
                     }
 
                 case command := <- commandCh:
-                    i := command.Id() % CONNS_PER_WORKER
-                    if command.Command() == WRITE {
+                    i := command.ConnId() % CONNS_PER_WORKER
+                    if command.Type() == WRITE {
                         conn := connL[i]
-                        msg := command.(*WriteMessage).msg
+                        msg := command.(*message).msg
                         (*conn.conn).Write(msg)
                     }
                 default:
@@ -164,8 +164,8 @@ func worker(incomingCh chan *Connection, globalReaderCh chan *ReadMessage, comma
     }
 }
 
-func tryRead(globalReaderCh chan *ReadMessage, connection *Connection) error {
-    conn := connection.conn
+func tryRead(globalReaderCh chan *message, c *connection) error {
+    conn := c.conn
 
     (*conn).SetReadDeadline(time.Now())
 
@@ -174,7 +174,7 @@ func tryRead(globalReaderCh chan *ReadMessage, connection *Connection) error {
     if err == io.EOF {
         return err
     } else if bcount > 0 {
-        msg := &ReadMessage{ connection.id, buf }
+        msg := &message{ c.id, buf }
         globalReaderCh <- msg
     }
     return nil
