@@ -17,10 +17,6 @@ type connection struct {
     id       uint64
 }
 
-type message struct {
-    id  uint64
-    msg []byte
-}
 
 type command interface {
     ConnId()  uint64
@@ -33,13 +29,22 @@ const (
     CLOSE
 )
 
+type message struct {
+    id  uint64
+    msg []byte
+}
+
 //A message being interpreted as a command is always going to be a write command,
 //the data in the message being what is written
 func (m *message) Type()   int    { return WRITE }
 func (m *message) ConnId() uint64 { return m.id  }
 
+type closeCommand uint64
+func (c *closeCommand) Type()   int    { return CLOSE }
+func (c *closeCommand) ConnId() uint64 { return uint64(*c) }
+
 type Flamingo struct {
-    globalReaderCh chan *message
+    globalReadCh chan *message
     commandRouter  map[uint64]chan command
 }
 
@@ -54,22 +59,28 @@ func New(port int) (*Flamingo) {
     incomingCh := makeAcceptors(server)
 
     //The channel that we can read from to get data from connections
-    globalReaderCh := make(chan *message,2000)
+    globalReadCh := make(chan *message,2000)
 
-    flamingo := &Flamingo{ globalReaderCh, commandRouter }
+    flamingo := &Flamingo{ globalReadCh, commandRouter }
     go distributor(flamingo,incomingCh)
 
     return flamingo
 }
 
 func (f *Flamingo) RecvData() (uint64,[]byte) {
-    msg := <- f.globalReaderCh
+    msg := <- f.globalReadCh
     return msg.id, msg.msg
 }
 
 func (f *Flamingo) SendData(id uint64, msg []byte) {
     wrmsg := &message{ id, msg }
     f.commandRouter[ id / CONNS_PER_WORKER ] <- wrmsg
+}
+
+func (f *Flamingo) Close(id uint64) {
+    cmsg := closeCommand(id)
+    f.commandRouter[ id / CONNS_PER_WORKER ] <- &cmsg
+    fmt.Printf("commandRouter:%v\n",f.commandRouter)
 }
 
 func makeAcceptors(listener net.Listener) chan *connection {
@@ -120,7 +131,7 @@ func distributor(f *Flamingo, incomingCh chan *connection) {
 
 func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan command) {
 
-    globalReaderCh := f.globalReaderCh
+    globalReadCh := f.globalReadCh
     commandRouter  := f.commandRouter
 
     connL := make([]*connection,CONNS_PER_WORKER)
@@ -131,7 +142,7 @@ func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan c
     for {
         for i,conn := range connL {
             if (conn != nil) {
-                err := tryRead(globalReaderCh,conn)
+                err := tryRead(globalReadCh,conn)
                 if err != nil { connL[i] = nil; connSlotsUsed--; }
             }
         }
@@ -148,10 +159,17 @@ func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan c
 
                 case command := <- commandCh:
                     ci := command.ConnId() % CONNS_PER_WORKER
-                    if command.Type() == WRITE {
-                        conn := connL[ci]
-                        msg := command.(*message).msg
-                        (*conn.conn).Write(msg)
+                    switch command.Type() {
+                        case WRITE:
+                            conn := connL[ci]
+                            msg := command.(*message).msg
+                            (*conn.conn).Write(msg)
+
+                        case CLOSE:
+                            conn := connL[ci]
+                            (*conn.conn).Close()
+                            connL[ci] = nil
+                            connSlotsUsed--
                     }
                 default:
                     loop = false
@@ -170,7 +188,7 @@ func worker(f *Flamingo, i uint64, incomingCh chan *connection, commandCh chan c
     }
 }
 
-func tryRead(globalReaderCh chan *message, c *connection) error {
+func tryRead(globalReadCh chan *message, c *connection) error {
     conn := c.conn
 
     (*conn).SetReadDeadline(time.Now())
@@ -181,7 +199,7 @@ func tryRead(globalReaderCh chan *message, c *connection) error {
         return err
     } else if bcount > 0 {
         msg := &message{ c.id, buf }
-        globalReaderCh <- msg
+        globalReadCh <- msg
     }
     return nil
 }
