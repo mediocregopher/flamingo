@@ -9,9 +9,6 @@ import (
     "time"
 )
 
-const CONN_TIMEOUT_CHECK = 10 //seconds
-const CONNS_PER_WORKER = 500
-
 type Id uint64
 type workerId uint64
 
@@ -57,6 +54,11 @@ func newCommandRouter() *commandRouter {
     }
 }
 
+type Opts struct {
+    Conns_per_worker uint64
+    Port             int
+}
+
 type Flamingo struct {
     //These are going to be read from by the application
     globalOpenCh  chan *connection
@@ -66,11 +68,17 @@ type Flamingo struct {
     //For private use
     incomingCh chan *connection
     cmdR       *commandRouter
+    opts       *Opts
 }
 
-func New(port int) *Flamingo {
+func New(opts Opts) *Flamingo {
+
+    //Populate default options
+    if opts.Conns_per_worker == 0 { opts.Conns_per_worker = 500 }
+    fmt.Printf("cpw:%d\n",opts.Conns_per_worker)
+
     //Make our listen socket
-    server, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+    server, err := net.Listen("tcp", ":"+strconv.Itoa(opts.Port))
     if server == nil {
         panic("couldn't start listening: " + err.Error())
     }
@@ -79,7 +87,8 @@ func New(port int) *Flamingo {
         globalReadCh:  make(chan *message, 2000),
         globalCloseCh: make(chan *connection, 2000),
         incomingCh:    make(chan *connection),
-        cmdR:          newCommandRouter()}
+        cmdR:          newCommandRouter(),
+        opts:          &opts}
 
     //Spawn a routine to listen for new connections
     makeAcceptors(flamingo, server)
@@ -115,8 +124,9 @@ func (f *Flamingo) SendClose(cid Id) {
 }
 
 func (f *Flamingo) routeCommand(cid Id, c command) {
+    conns_per_worker := f.opts.Conns_per_worker
     f.cmdR.RLock()
-    f.cmdR.m[workerId(cid/CONNS_PER_WORKER)] <- c
+    f.cmdR.m[workerId(uint64(cid)/conns_per_worker)] <- c
     f.cmdR.RUnlock()
 }
 
@@ -153,6 +163,7 @@ func makeAcceptors(f *Flamingo, listener net.Listener) {
 }
 
 func distributor(f *Flamingo) {
+    conns_per_worker := f.opts.Conns_per_worker
     for wid := workerId(0); ; wid++ {
         workerCommandCh := make(chan command, 20)
         workerIncomingCh := make(chan *connection, 20)
@@ -163,7 +174,8 @@ func distributor(f *Flamingo) {
         f.cmdR.Unlock()
 
         //This works, but I think it's a bottleneck
-        for connCount := 0; connCount < CONNS_PER_WORKER; connCount++ {
+        var connCount uint64
+        for connCount = 0; connCount < conns_per_worker; connCount++ {
             workerIncomingCh <- <-f.incomingCh
         }
 
@@ -173,9 +185,10 @@ func distributor(f *Flamingo) {
 
 func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh chan command) {
 
+    conns_per_worker := f.opts.Conns_per_worker
     globalReadCh := f.globalReadCh
 
-    connL := make([]*connection, CONNS_PER_WORKER)
+    connL := make([]*connection, conns_per_worker)
     connSlotsUsed := 0
 
     stillInUse := true
@@ -199,12 +212,12 @@ func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh ch
                 if conn == nil {
                     stillInUse = false
                 } else {
-                    connL[conn.cid%CONNS_PER_WORKER] = conn
+                    connL[uint64(conn.cid)%conns_per_worker] = conn
                     connSlotsUsed++
                 }
 
             case command := <-commandCh:
-                ci := command.ConnId() % CONNS_PER_WORKER
+                ci := uint64(command.ConnId()) % conns_per_worker
                 switch command.Type() {
                 case WRITE:
                     conn := connL[ci]
