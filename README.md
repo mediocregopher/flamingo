@@ -30,7 +30,9 @@ func main() {
     port,_ := strconv.Atoi(portStr)
 
     //It's dangerous to go alone, take this flamingo
-    flamingo := flamingo.New(port)
+    flamingo := flamingo.New(flamingo.Opts{
+        Port: port,
+    })
     fmt.Printf("Port created\n")
 
     //This routine handles all incoming connections. RecvOpen will block until a connection
@@ -84,13 +86,7 @@ func main() {
 
 ## What/How/Why?
 
-The current documentation on how to set up a tcp-listen server with go is to simply spawn a new
-goroutine for every connection that comes in. While this works for a finite amount of connections
-just fine, in my testing once you go over 250k things start to fall over. The solution for this is
-to have a single goroutine handle multiple connections at once. Flamingo does this and handles it
-for you.
-
-Another problem with highly concurrent systems is that of routing. For example, in a pub/sub server,
+One of problems with highly concurrent systems is that of routing. For example, in a pub/sub server,
 when a publish happens the server must get the list of connections from some datastore (or memory)
 and loop through them. But what is that list? If the datastore is external to the program it's
 probably a list of strings or integers. How to map those identifiers to socket descriptors? Flamingo

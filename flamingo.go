@@ -2,15 +2,12 @@ package flamingo
 
 import (
     "fmt"
-    "io"
     "net"
     "strconv"
     "sync"
-    "time"
 )
 
 type Id uint64
-type workerId uint64
 
 type connection struct {
     conn *net.Conn
@@ -39,23 +36,21 @@ func (m *message) Type() int  { return WRITE }
 func (m *message) ConnId() Id { return m.cid }
 
 type closeCommand Id
-
 func (c *closeCommand) Type() int  { return CLOSE }
 func (c *closeCommand) ConnId() Id { return Id(*c) }
 
 type commandRouter struct {
     sync.RWMutex
-    m map[workerId]chan command
+    m map[Id]chan command
 }
 
 func newCommandRouter() *commandRouter {
     return &commandRouter{
-        m: map[workerId]chan command{},
+        m: map[Id]chan command{},
     }
 }
 
 type Opts struct {
-    Conns_per_worker uint64
     Port             int
 }
 
@@ -74,8 +69,6 @@ type Flamingo struct {
 func New(opts Opts) *Flamingo {
 
     //Populate default options
-    if opts.Conns_per_worker == 0 { opts.Conns_per_worker = 500 }
-    fmt.Printf("cpw:%d\n",opts.Conns_per_worker)
 
     //Make our listen socket
     server, err := net.Listen("tcp", ":"+strconv.Itoa(opts.Port))
@@ -83,12 +76,14 @@ func New(opts Opts) *Flamingo {
         panic("couldn't start listening: " + err.Error())
     }
 
-    flamingo := &Flamingo{globalOpenCh: make(chan *connection, 2000),
-        globalReadCh:  make(chan *message, 2000),
-        globalCloseCh: make(chan *connection, 2000),
+    flamingo := &Flamingo{
+        globalOpenCh:  make(chan *connection, 2048),
+        globalReadCh:  make(chan *message, 2048),
+        globalCloseCh: make(chan *connection, 2048),
         incomingCh:    make(chan *connection),
         cmdR:          newCommandRouter(),
-        opts:          &opts}
+        opts:          &opts,
+    }
 
     //Spawn a routine to listen for new connections
     makeAcceptors(flamingo, server)
@@ -124,9 +119,8 @@ func (f *Flamingo) SendClose(cid Id) {
 }
 
 func (f *Flamingo) routeCommand(cid Id, c command) {
-    conns_per_worker := f.opts.Conns_per_worker
     f.cmdR.RLock()
-    f.cmdR.m[workerId(uint64(cid)/conns_per_worker)] <- c
+    f.cmdR.m[cid] <- c
     f.cmdR.RUnlock()
 }
 
@@ -163,104 +157,81 @@ func makeAcceptors(f *Flamingo, listener net.Listener) {
 }
 
 func distributor(f *Flamingo) {
-    conns_per_worker := f.opts.Conns_per_worker
-    for wid := workerId(0); ; wid++ {
-        workerCommandCh := make(chan command, 20)
-        workerIncomingCh := make(chan *connection, 20)
+    for conn := range f.incomingCh {
 
-        go worker(f, wid, workerIncomingCh, workerCommandCh)
+        workerCommandCh := make(chan command, 20)
+        go connWorker(f, conn, workerCommandCh)
         f.cmdR.Lock()
-        f.cmdR.m[wid] = workerCommandCh
+        f.cmdR.m[conn.cid] = workerCommandCh
         f.cmdR.Unlock()
 
-        //This works, but I think it's a bottleneck
-        var connCount uint64
-        for connCount = 0; connCount < conns_per_worker; connCount++ {
-            workerIncomingCh <- <-f.incomingCh
-        }
-
-        workerIncomingCh <- nil
     }
 }
 
-func worker(f *Flamingo, wid workerId, incomingCh chan *connection, commandCh chan command) {
+type readChRet struct {
+    msg []byte
+    err error
+}
+func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
 
-    conns_per_worker := f.opts.Conns_per_worker
-    globalReadCh := f.globalReadCh
-
-    connL := make([]*connection, conns_per_worker)
-    connSlotsUsed := 0
-
-    stillInUse := true
-
+    workerReadCh  := make(chan *readChRet)
+    readMore := true
     for {
-        for i, conn := range connL {
-            if conn != nil {
-                err := tryRead(globalReadCh, conn)
+
+        //readMore keeps track of whether or not a routine is already reading
+        //off the connection. If there isn't one we make another
+        if readMore {
+            go func(){
+                var ret readChRet
+                buf := make([]byte,1024)
+                bcount, err := (*conn.conn).Read(buf)
                 if err != nil {
-                    (*conn.conn).Close()
-                    connL[i] = nil
-                    connSlotsUsed--
-                    f.globalCloseCh <- conn
-                }
-            }
-        }
-
-        for loop := true; loop == true; {
-            select {
-            case conn := <-incomingCh:
-                if conn == nil {
-                    stillInUse = false
+                    ret = readChRet{nil,err}
+                } else if bcount > 0 {
+                    ret = readChRet{buf,nil}
                 } else {
-                    connL[uint64(conn.cid)%conns_per_worker] = conn
-                    connSlotsUsed++
+                    ret = readChRet{nil,nil}
                 }
-
-            case command := <-commandCh:
-                ci := uint64(command.ConnId()) % conns_per_worker
-                switch command.Type() {
-                case WRITE:
-                    conn := connL[ci]
-                    msg := command.(*message).msg
-                    (*conn.conn).Write(msg)
-
-                case CLOSE:
-                    conn := connL[ci]
-                    (*conn.conn).Close()
-                    connL[ci] = nil
-                    connSlotsUsed--
-                }
-            default:
-                loop = false
-            }
+                workerReadCh <- &ret
+            }()
+            readMore = false
         }
 
-        //If we're not in use (no incoming conns) and there's none
-        //connected we're done. Tell the writer we're done too
-        if !stillInUse && connSlotsUsed == 0 {
-            //TODO it's possible that the user's routines may write here after the nil,
-            //     do we care? At this point all connections should be closed so it's
-            //     probably moot
-            f.cmdR.Lock()
-            delete(f.cmdR.m, wid)
-            f.cmdR.Unlock()
-            return
+        select {
+
+        //If we pull a command off we decode it and act accordingly
+        case command := <-commandCh:
+            switch command.Type() {
+            case WRITE:
+                msg := command.(*message).msg
+                (*conn.conn).Write(msg)
+
+            case CLOSE:
+                closeAndRemove(f,conn)
+                return
+            }
+
+
+        //If the goroutine doing the reading gets data we check it for an error
+        //and send it to the globalReadCh to be handled
+        case rcr := <-workerReadCh:
+            readMore = true
+            msg,err := rcr.msg,rcr.err
+            if err != nil {
+                closeAndRemove(f,conn)
+                f.globalCloseCh <- conn
+                return
+            } else if msg != nil {
+                f.globalReadCh <- &message{conn.cid,msg}
+            }
         }
     }
 }
 
-func tryRead(globalReadCh chan *message, c *connection) error {
-    conn := c.conn
-
-    (*conn).SetReadDeadline(time.Now())
-
-    buf := make([]byte, 1024)
-    bcount, err := (*conn).Read(buf)
-    if err == io.EOF {
-        return err
-    } else if bcount > 0 {
-        msg := &message{c.cid, buf}
-        globalReadCh <- msg
-    }
-    return nil
+//Closes a connection and removes it from the router
+func closeAndRemove(f *Flamingo, conn *connection) {
+    (*conn.conn).Close()
+    f.cmdR.Lock()
+    delete(f.cmdR.m,conn.cid)
+    f.cmdR.Unlock()
 }
