@@ -98,10 +98,9 @@ deals with the job of routing to an actual socket descriptor.
 Flamingo is still in development and is far from being stable or production ready. Things to-do:
 
 * Make it possible to set socket options on the listen socket
-* Make it possible to specify constant values like CONNS_PER_WORKER
 * Make workers have the ability to buffer data until they find some delimiter, because with the current
   setup that's really difficult for the application to do.
-* Make it possible to get status information out (number of connections, number of workers, etc...)
+* Make it possible to get status information out (number of connections, etc...)
 * Make some real documentation
 * Load test this thing, haven't done so since the first iteration, of which only the core code is left
 * Method for serializing the id
