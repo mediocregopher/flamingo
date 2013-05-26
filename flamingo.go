@@ -54,6 +54,7 @@ func newCommandRouter() *commandRouter {
 type Opts struct {
     Port            int
     ActivityTimeout time.Duration
+    BufferSize      int
 }
 
 type Flamingo struct {
@@ -69,6 +70,9 @@ type Flamingo struct {
 }
 
 func New(opts Opts) *Flamingo {
+
+    //Default options
+    if opts.BufferSize == 0 { opts.BufferSize = 1024 }
 
     //Make our listen socket
     server, err := net.Listen("tcp", ":"+strconv.Itoa(opts.Port))
@@ -183,7 +187,7 @@ func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
         if readMore {
             go func(){
                 var ret readChRet
-                buf := make([]byte,1024)
+                buf := make([]byte,f.opts.BufferSize)
                 bcount, err := (*conn.conn).Read(buf)
                 if err != nil {
                     ret = readChRet{nil,err}

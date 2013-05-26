@@ -37,6 +37,10 @@ func main() {
         //How long to keep a connection alive when it hasn't had any new data
         //and no commands called on it. Defaults to zero, meaning no timeout
         ActivityTimeout: 5 * time.Second,
+
+        //Max number of bytes to read off the socket at a time. Defaults to 1024,
+        //doesn't really need to be set unless you have a specific reason
+        BufferSize: 1024,
     })
     fmt.Printf("Port created\n")
 
