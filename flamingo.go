@@ -6,6 +6,8 @@ import (
     "strconv"
     "sync"
     "time"
+    "bytes"
+    "io"
 )
 
 type Id uint64
@@ -55,6 +57,8 @@ type Opts struct {
     Port            int
     ActivityTimeout time.Duration
     BufferSize      int
+    BufferTillDelim bool
+    Delim           byte
 }
 
 type Flamingo struct {
@@ -180,6 +184,7 @@ func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
 
     workerReadCh  := make(chan *readChRet)
     readMore := true
+    readBuf := new(bytes.Buffer)
     for {
 
         //readMore keeps track of whether or not a routine is already reading
@@ -233,7 +238,22 @@ func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
                 f.globalCloseCh <- conn
                 return
             } else if msg != nil {
-                f.globalReadCh <- &message{conn.cid,msg}
+                if f.opts.BufferTillDelim {
+                    readBuf.Write(msg)
+                    for {
+                        fullMsg,err := readBuf.ReadBytes(f.opts.Delim)
+                        if err == io.EOF {
+                            //We got to the end of the buffer without finding a delim,
+                            //write back what we did find so it can be searched the next time
+                            readBuf.Write(fullMsg)
+                            break
+                        } else {
+                            f.globalReadCh <- &message{conn.cid,fullMsg}
+                        }
+                    }
+                } else {
+                    f.globalReadCh <- &message{conn.cid,msg}
+                }
             }
 
         case <-timeoutChan:

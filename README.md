@@ -41,6 +41,12 @@ func main() {
         //Max number of bytes to read off the socket at a time. Defaults to 1024,
         //doesn't really need to be set unless you have a specific reason
         BufferSize: 1024,
+
+        //If we want to buffer data until we hit a specific byte, set to true and
+        //and specify the byte we want. Messages read from RecvData will include
+        //the trailing delimeter
+        BufferTillDelim: true,
+        Delim: '\n',
     })
     fmt.Printf("Port created\n")
 
@@ -101,6 +107,13 @@ and loop through them. But what is that list? If the datastore is external to th
 probably a list of strings or integers. How to map those identifiers to socket descriptors? Flamingo
 takes care of that. All sockets are identified by a single, serializable identifier, and flamingo
 deals with the job of routing to an actual socket descriptor.
+
+## Limitations
+
+Currently the most obvious limitation of flamingo is in socket data buffering. If the messages you're
+going to be receiving on your sockets are anything more complicated then data ending in a specific
+delimiter you're going to have a difficult time. I'm still trying to think of the best solution for
+this, and will absolutely take suggestions if anyone has any.
 
 ## Todo
 
