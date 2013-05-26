@@ -15,6 +15,7 @@ import (
     "runtime"
     "os"
     "strconv"
+    "time"
     "flamingo"
 )
 
@@ -32,6 +33,10 @@ func main() {
     //It's dangerous to go alone, take this flamingo
     flamingo := flamingo.New(flamingo.Opts{
         Port: port,
+
+        //How long to keep a connection alive when it hasn't had any new data
+        //and no commands called on it. Defaults to zero, meaning no timeout
+        ActivityTimeout: 5 * time.Second,
     })
     fmt.Printf("Port created\n")
 
@@ -104,4 +109,3 @@ Flamingo is still in development and is far from being stable or production read
 * Make some real documentation
 * Load test this thing, haven't done so since the first iteration, of which only the core code is left
 * Method for serializing the id
-* Creating timeouts for socket inactivity

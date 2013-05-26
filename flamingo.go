@@ -5,6 +5,7 @@ import (
     "net"
     "strconv"
     "sync"
+    "time"
 )
 
 type Id uint64
@@ -51,7 +52,8 @@ func newCommandRouter() *commandRouter {
 }
 
 type Opts struct {
-    Port             int
+    Port            int
+    ActivityTimeout time.Duration
 }
 
 type Flamingo struct {
@@ -67,8 +69,6 @@ type Flamingo struct {
 }
 
 func New(opts Opts) *Flamingo {
-
-    //Populate default options
 
     //Make our listen socket
     server, err := net.Listen("tcp", ":"+strconv.Itoa(opts.Port))
@@ -197,6 +197,13 @@ func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
             readMore = false
         }
 
+        //TODO it may be possible for someone to generate a lot of superfluous
+        //     routines if the timeout is set high and a lot of data is sent
+        var timeoutChan <- chan time.Time
+        if f.opts.ActivityTimeout > 0 {
+            timeoutChan = time.After(f.opts.ActivityTimeout)
+        }
+
         select {
 
         //If we pull a command off we decode it and act accordingly
@@ -224,6 +231,12 @@ func connWorker(f *Flamingo, conn *connection, commandCh chan command) {
             } else if msg != nil {
                 f.globalReadCh <- &message{conn.cid,msg}
             }
+
+        case <-timeoutChan:
+            closeAndRemove(f,conn)
+            f.globalCloseCh <- conn
+            return
+
         }
     }
 }
